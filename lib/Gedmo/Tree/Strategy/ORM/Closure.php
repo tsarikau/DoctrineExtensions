@@ -231,59 +231,59 @@ class Closure implements Strategy
     public function processPostPersist($em, $entity, AdapterInterface $ea)
     {
         $uow = $em->getUnitOfWork();
+        $node=$this->pendingChildNodeInserts[spl_object_hash($entity)];
+        unset($this->pendingChildNodeInserts[spl_object_hash($entity)]);
 
-        while ($node = array_shift($this->pendingChildNodeInserts)) {
-            $meta = $em->getClassMetadata(get_class($node));
-            $config = $this->listener->getConfiguration($em, $meta->name);
+        $meta = $em->getClassMetadata(get_class($node));
+        $config = $this->listener->getConfiguration($em, $meta->name);
 
-            $identifier = $meta->getSingleIdentifierFieldName();
-            $nodeId = $meta->getReflectionProperty($identifier)->getValue($node);
-            $parent = $meta->getReflectionProperty($config['parent'])->getValue($node);
+        $identifier = $meta->getSingleIdentifierFieldName();
+        $nodeId = $meta->getReflectionProperty($identifier)->getValue($node);
+        $parent = $meta->getReflectionProperty($config['parent'])->getValue($node);
 
-            $closureClass = $config['closure'];
-            $closureMeta = $em->getClassMetadata($closureClass);
-            $closureTable = $closureMeta->getTableName();
+        $closureClass = $config['closure'];
+        $closureMeta = $em->getClassMetadata($closureClass);
+        $closureTable = $closureMeta->getTableName();
 
-            $ancestorColumnName = $this->getJoinColumnFieldName($em->getClassMetadata($config['closure'])->getAssociationMapping('ancestor'));
-            $descendantColumnName = $this->getJoinColumnFieldName($em->getClassMetadata($config['closure'])->getAssociationMapping('descendant'));
-            $depthColumnName = $em->getClassMetadata($config['closure'])->getColumnName('depth');
+        $ancestorColumnName = $this->getJoinColumnFieldName($em->getClassMetadata($config['closure'])->getAssociationMapping('ancestor'));
+        $descendantColumnName = $this->getJoinColumnFieldName($em->getClassMetadata($config['closure'])->getAssociationMapping('descendant'));
+        $depthColumnName = $em->getClassMetadata($config['closure'])->getColumnName('depth');
 
-            $entries = array(
-                array(
-                    $ancestorColumnName => $nodeId,
+        $entries = array(
+            array(
+                $ancestorColumnName => $nodeId,
+                $descendantColumnName => $nodeId,
+                $depthColumnName => 0
+            )
+        );
+
+        if ($parent) {
+            $dql = "SELECT c, a FROM {$closureMeta->name} c";
+            $dql .= " JOIN c.ancestor a";
+            $dql .= " WHERE c.descendant = :parent";
+            $q = $em->createQuery($dql);
+            $q->setParameters(compact('parent'));
+            $ancestors = $q->getArrayResult();
+
+            foreach ($ancestors as $ancestor) {
+                $entries[] = array(
+                    $ancestorColumnName => $ancestor['ancestor']['id'],
                     $descendantColumnName => $nodeId,
-                    $depthColumnName => 0
-                )
-            );
-
-            if ($parent) {
-                $dql = "SELECT c, a FROM {$closureMeta->name} c";
-                $dql .= " JOIN c.ancestor a";
-                $dql .= " WHERE c.descendant = :parent";
-                $q = $em->createQuery($dql);
-                $q->setParameters(compact('parent'));
-                $ancestors = $q->getArrayResult();
-
-                foreach ($ancestors as $ancestor) {
-                    $entries[] = array(
-                        $ancestorColumnName => $ancestor['ancestor']['id'],
-                        $descendantColumnName => $nodeId,
-                        $depthColumnName => $ancestor['depth'] + 1
-                    );
-                }
-
-                if (isset($config['level'])) {
-                    $this->pendingNodesLevelProcess[$nodeId] = $node;
-                }
-            } else if (isset($config['level'])) {
-                $uow->scheduleExtraUpdate($node, array($config['level'] => array(null, 1)));
-                $ea->setOriginalObjectProperty($uow, spl_object_hash($node), $config['level'], 1);
+                    $depthColumnName => $ancestor['depth'] + 1
+                );
             }
 
-            foreach ($entries as $closure) {
-                if (!$em->getConnection()->insert($closureTable, $closure)) {
-                    throw new RuntimeException('Failed to insert new Closure record');
-                }
+            if (isset($config['level'])) {
+                $this->pendingNodesLevelProcess[$nodeId] = $node;
+            }
+        } else if (isset($config['level'])) {
+            $uow->scheduleExtraUpdate($node, array($config['level'] => array(null, 1)));
+            $ea->setOriginalObjectProperty($uow, spl_object_hash($node), $config['level'], 1);
+        }
+
+        foreach ($entries as $closure) {
+            if (!$em->getConnection()->insert($closureTable, $closure)) {
+                throw new RuntimeException('Failed to insert new Closure record');
             }
         }
 
