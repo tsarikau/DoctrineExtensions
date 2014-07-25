@@ -278,6 +278,7 @@ class Closure implements Strategy
             }
         } else if (isset($config['level'])) {
             $uow->scheduleExtraUpdate($node, array($config['level'] => array(null, 1)));
+            $meta->getReflectionProperty($config['level'])->setValue($node,1);
             $ea->setOriginalObjectProperty($uow, spl_object_hash($node), $config['level'], 1);
         }
 
@@ -348,6 +349,7 @@ class Closure implements Strategy
                         $meta->getReflectionProperty($config['level'])->getValue($node), $level
                     ))
                 );
+                $meta->getReflectionProperty($config['level'])->setValue($node,$level);
                 $uow->setOriginalEntityProperty(spl_object_hash($node), $config['level'], $level);
             }
 
