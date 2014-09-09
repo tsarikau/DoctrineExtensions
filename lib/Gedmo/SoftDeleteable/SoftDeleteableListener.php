@@ -5,11 +5,11 @@ namespace Gedmo\SoftDeleteable;
 use Doctrine\Common\Persistence\ObjectManager,
     Doctrine\Common\Persistence\Mapping\ClassMetadata,
     Doctrine\ORM\Mapping\ClassMetadataInfo,
-    Gedmo\Mapping\MappedEventSubscriber,
+    Doctrine\Common\EventArgs,
+
+Gedmo\Mapping\MappedEventSubscriber,
     Gedmo\Mapping\Event\AdapterInterface,
-    Gedmo\Loggable\Mapping\Event\LoggableAdapter,
-    Doctrine\Common\EventArgs
-;
+    Gedmo\Loggable\Mapping\Event\LoggableAdapter;
 
 /**
  * SoftDeleteable listener
@@ -34,7 +34,24 @@ class SoftDeleteableListener extends MappedEventSubscriber
      */
     const POST_SOFT_DELETE = "postSoftDelete";
 
-    protected $cascadeDeletes=false;
+
+    /**
+     * onDelete="CASCADE"
+     */
+    const ON_DELETE_CASCADE = 'DELETE';
+
+    /**
+     * onDelete="SET NULL"
+     */
+    const ON_DELETE_SET_NULL = 'SET_NULL';
+
+    /**
+     * Cascade operations mapping
+     * @var bool
+     */
+    protected $onDelete = false;
+
+    protected $visited = array();
 
     /**
      * {@inheritdoc}
@@ -65,16 +82,15 @@ class SoftDeleteableListener extends MappedEventSubscriber
      */
     public function onFlush(EventArgs $args)
     {
+        $this->visited = array();
+
         $ea = $this->getEventAdapter($args);
         $om = $ea->getObjectManager();
         $uow = $om->getUnitOfWork();
 
         //getScheduledDocumentDeletions
         foreach ($ea->getScheduledObjectDeletions($uow) as $object) {
-            $meta = $om->getClassMetadata(get_class($object));
-            $config = $this->getConfiguration($om, $meta->name);
-
-            if (isset($config['softDeleteable']) && $config['softDeleteable']) {
+            if ($this->isSoftDeleteable($om, $om->getClassMetadata(get_class($object)))) {
                 $this->scheduleSoftDelete($ea,$object);
             }
         }
@@ -89,6 +105,13 @@ class SoftDeleteableListener extends MappedEventSubscriber
      */
     protected function scheduleSoftDelete(AdapterInterface $ea,$object)
     {
+        $object_hash = spl_object_hash($object);
+        if (in_array($object_hash, $this->visited)) {
+            return;
+        }
+
+        $this->visited[] = $object_hash;
+
         $om = $ea->getObjectManager();
         $uow = $om->getUnitOfWork();
         $evm = $om->getEventManager();
@@ -112,17 +135,21 @@ class SoftDeleteableListener extends MappedEventSubscriber
         $reflProp->setValue($object, $date);
 
         $om->persist($object);
+
+        $uow->setOriginalEntityProperty(spl_object_hash($object), $config['fieldName'], $date);
         $uow->propertyChanged($object, $config['fieldName'], $oldValue, $date);
+
         $uow->scheduleExtraUpdate($object, array(
                 $config['fieldName'] => array($oldValue, $date)
             ));
+
+        $this->scheduleCascadeDeletes($ea, $object);
 
         $evm->dispatchEvent(
             self::POST_SOFT_DELETE,
             $ea->createLifecycleEventArgsInstance($object, $om)
         );
 
-        $this->scheduleCascadeDeletes($ea,$object);
     }
 
     /**
@@ -134,55 +161,109 @@ class SoftDeleteableListener extends MappedEventSubscriber
     protected function scheduleCascadeDeletes(AdapterInterface $ea, $object)
     {
         $om = $ea->getObjectManager();
+        $uow = $om->getUnitOfWork();
 
         $this->loadCascadesConfig($ea);
 
         $meta = $om->getClassMetadata(get_class($object));
 
-        if (!isset($this->cascadeDeletes[$meta->getName()])) {
+        if (!isset($this->onDelete[$meta->getName()])) {
             return;
         }
 
-        $identifier=$meta->getIdentifierValues($object);
+        $id = $identifier = $meta->getIdentifierValues($object);
 
         if (count($identifier)===1) {
-            $identifier=reset($identifier);
+            $id = reset($identifier);
         }
 
-        foreach ($this->cascadeDeletes[$meta->getName()] as $objectClass=>$fields) {
+        foreach ($this->onDelete[$meta->getName()] as $targetClass => $onDelete) {
+
+            $targetClassMetadata = $om->getClassMetadata($targetClass);
+
+            $isSoftdeleteable = $this->isSoftDeleteable($om, $targetClassMetadata);
 
             /** @var \Doctrine\ORM\QueryBuilder $qb */
-            $qb=$om->getRepository($objectClass)->createQueryBuilder('e');
+            $qb = $om->getRepository($targetClass)->createQueryBuilder('e');
 
-            $orx=$qb->expr()->orX();
+            $orx = $qb->expr()->orX();
 
-            foreach ($fields as $field) {
-                $orx->add($qb->expr()->eq(sprintf('e.%s',$field),':identifier'));
+            $associations = call_user_func_array('array_merge', array_values($onDelete));
+
+            foreach ($associations as $field) {
+                $orx->add($qb->expr()->eq(sprintf('e.%s', $field), ':id'));
+                $qb->addSelect(sprintf('IDENTITY(e.%s) as %s', $field, $field));
             }
 
             $qb
                 ->where($orx)
-                ->setParameter('identifier',$identifier);
+                ->setParameter('id', $id);
 
-            foreach ($qb->getQuery()->getResult() as $cascadeObject) {
-                $this->scheduleSoftDelete($ea,$cascadeObject);
+            $query = $qb->getQuery();
+
+//            foreach ($onDelete[self::ON_DELETE_CASCADE] as $field) {
+//                $query->setFetchMode($targetClass, $field, ClassMetadataInfo::FETCH_EAGER);
+//            }
+
+
+            $grouped = array_fill_keys($associations, array());
+
+            if ($results = $query->getResult()) {
+                foreach ($results as $result) {
+                    $object = $result[0];
+                    foreach ($grouped as $association => &$objects) {
+                        if (isset($result[$association]) && $result[$association] == $id) {
+                            $objects[] = $object;
+                        }
+                    }
+                }
+            }
+
+            foreach ($onDelete[self::ON_DELETE_SET_NULL] as $association) {
+
+                foreach ($grouped[$association] as $o) {
+                    $oldValue = $targetClassMetadata->getFieldValue($o, $association);
+
+                    $targetClassMetadata->setFieldValue($o, $association, null);
+
+                    $uow->setOriginalEntityProperty(spl_object_hash($o), $association, null);
+                    $uow->propertyChanged($o, $association, $oldValue, null);
+
+                    $uow->scheduleExtraUpdate(
+                        $o,
+                        array(
+                            $association => array($oldValue, null)
+                        )
+                    );
+                }
+            }
+
+            foreach ($onDelete[self::ON_DELETE_CASCADE] as $association) {
+
+                foreach ($grouped[$association] as $o) {
+                    if ($isSoftdeleteable) {
+                        $this->scheduleSoftDelete($ea, $o);
+                    }
+                    /*else{
+                        $uow->scheduleForDelete($o);
+                    }*/
+                }
             }
         }
     }
 
     /**
-     * Load cascades mapping
      * @todo: metadata cache
      *
      * @param AdapterInterface $ea
      */
     protected function loadCascadesConfig(AdapterInterface $ea)
     {
-        if ($this->cascadeDeletes!==false) {
+        if ($this->onDelete !== false) {
             return;
         }
 
-        $this->cascadeDeletes=array();
+        $this->onDelete = array();
 
         $om = $ea->getObjectManager();
 
@@ -195,15 +276,28 @@ class SoftDeleteableListener extends MappedEventSubscriber
                 continue;
             }
 
-            $config = $this->getConfiguration($om, $meta->name);
+            foreach ($meta->associationMappings as $association => $mapping) {
 
-            if (!(isset($config['softDeleteable']) && $config['softDeleteable'])) {
-                continue;
-            }
+                $targetEntityMetadata = $om->getClassMetadata($mapping['targetEntity']);
 
-            foreach ($meta->associationMappings as $association=>$mapping) {
+                if (!$this->isSoftDeleteable($om, $targetEntityMetadata)) {
+                    continue;
+                }
 
-                if ($mapping['type'] === ClassMetadataInfo::MANY_TO_ONE) {
+                $sourceEntity = $mapping['sourceEntity'];
+
+                if ($sourceEntity !== $meta->name) {
+                    continue;
+                }
+
+                $onDelete = array(
+                    self::ON_DELETE_CASCADE => array(),
+                    self::ON_DELETE_SET_NULL => array()
+                );
+
+                $hasCascades = false;
+
+                if (($mapping['type'] & ClassMetadataInfo::TO_ONE) > 0 && $mapping['isOwningSide']) {
 
                     $joinColumnMapping=$mapping['joinColumns'][0];
 
@@ -211,30 +305,51 @@ class SoftDeleteableListener extends MappedEventSubscriber
                         continue;
                     }
 
-                    if (strtolower($joinColumnMapping['onDelete'])!=='cascade') {
-                        continue;
+                    switch (strtoupper($joinColumnMapping['onDelete'])) {
+                        case 'CASCADE':
+                            $onDelete[self::ON_DELETE_CASCADE][] = $association;
+                            $hasCascades = true;
+                            break;
+                        case 'SET NULL':
+                            $onDelete[self::ON_DELETE_SET_NULL][] = $association;
+                            $hasCascades = true;
+                            break;
                     }
+                }
 
-                } else {
+
+                if (!$hasCascades) {
                     continue;
                 }
 
-                $targetEntityMetadata=$metadataFactory->getMetadataFor($mapping['targetEntity']);
+                $targetEntities = array_merge(array($targetEntityMetadata->name), $targetEntityMetadata->subClasses);
 
-                foreach (array_merge(array($targetEntityMetadata->name),$targetEntityMetadata->subClasses) as $targetEntity) {
-                    if (!isset($this->cascadeDeletes[$targetEntity])) {
-                        $this->cascadeDeletes[$targetEntity]=array();
-                    }
+                foreach ($targetEntities as $targetEntity) {
 
-                    if (!isset($this->cascadeDeletes[$targetEntity][$meta->name])) {
-                        $this->cascadeDeletes[$targetEntity][$meta->name]=array();
-                    }
-
-                    $this->cascadeDeletes[$targetEntity][$meta->name][]=$association;
+                    $this->onDelete = array_merge_recursive(
+                        $this->onDelete,
+                        array(
+                            $targetEntity => array(
+                                $sourceEntity => $onDelete
+                            )
+                        )
+                    );
                 }
             }
 
         }
+    }
+
+    private function isSoftDeleteable(ObjectManager $om, ClassMetadata $meta)
+    {
+
+        $config = $this->getConfiguration($om, $meta->name);
+
+        if (isset($config['softDeleteable']) && $config['softDeleteable']) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
