@@ -168,7 +168,7 @@ class SoftDeleteableListener extends MappedEventSubscriber
      */
     protected function scheduleCascadeDeletes(AdapterInterface $ea, $object)
     {
-        $config = $this->resolver->getObjectCascadeConfiguration($object);
+        $config = $this->resolver->getClassCascadeMapping(get_class($object));
 
         if (!$config) {
             return;

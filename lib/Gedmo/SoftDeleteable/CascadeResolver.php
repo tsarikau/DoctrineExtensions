@@ -192,15 +192,14 @@ class CascadeResolver
         return $cascadeObjects;
     }
 
-    public function getObjectCascadeConfiguration($object)
+    public function getClassCascadeMapping($class)
     {
 
-        $config = $this->getCascadeConfiguration();
+        $config = $this->getCascadeMapping();
 
-        $sourceClass = get_class($object);
 
-        if (isset($config[$sourceClass])) {
-            return $config[$sourceClass];
+        if (isset($config[$class])) {
+            return $config[$class];
         }
 
         return array();
